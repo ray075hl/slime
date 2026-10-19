@@ -147,7 +147,6 @@ def build_dp_schedule(
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
         step_lengths = [total_lengths[i] for i in sample_indices]
-        global_batch_sizes.append(global_batch_size)
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "
             f"each step needs at least one sample per rank."
@@ -163,6 +162,38 @@ def build_dp_schedule(
             micro_batch_size=getattr(args, "micro_batch_size", None),
             balance_by_flops=args.balance_by_flops,
         )
+
+        # 1b. (PR #2065) When dynamic batching packs one long sample per mb, the
+        # mb count equals the sample count; rounding up to align_to then targets
+        # MORE mbs than samples, and singleton bins cannot be split further ->
+        # "could only produce N mbs ... need M" assert. Drop the minimum number
+        # of whole trailing rollouts so the aligned target stays reachable
+        # (keeps GRPO group atomicity + a contiguous prefix).
+        if args.use_dynamic_batch_size and align_to > 1:
+            dropped_rollouts = 0
+            while (
+                max(((len(step_mbs) + align_to - 1) // align_to) * align_to, align_to) > len(sample_indices)
+                and len(sample_indices) - len(rollout_id_to_samples[step_rollouts[-1]]) >= align_to
+            ):
+                step_rollouts = step_rollouts[:-1]
+                dropped_rollouts += 1
+                sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
+                step_lengths = [total_lengths[i] for i in sample_indices]
+                step_mbs = _pack_step_into_mbs(
+                    step_lengths,
+                    args=args,
+                    use_dynamic_batch_size=args.use_dynamic_batch_size,
+                    max_per_bin=max_per_bin,
+                    micro_batch_size=getattr(args, "micro_batch_size", None),
+                    balance_by_flops=args.balance_by_flops,
+                )
+            if dropped_rollouts:
+                logger.warning(
+                    "[dp_schedule] step %d: dropped %d trailing rollout(s) (%d kept, %d samples) so "
+                    "the aligned micro-batch target stays reachable (dp_size=%d, align_to=%d).",
+                    step_i, dropped_rollouts, len(step_rollouts), len(sample_indices), dp_size, align_to,
+                )
+        global_batch_sizes.append(len(step_rollouts))
 
         # 2. Align mbs count to a multiple of ``align_to``.
         target_K = max(((len(step_mbs) + align_to - 1) // align_to) * align_to, align_to)
