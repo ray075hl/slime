@@ -570,7 +570,7 @@ async def call_sglang_generate(
     sglang_url = adapter.sglang_url
     rid = None
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=7200)
     captured = Sample(tokens=list(prompt_ids))
     max_new_tokens = int(sp["max_new_tokens"])
     partial_rollout = getattr(adapter.rollout_args, "partial_rollout", False)
