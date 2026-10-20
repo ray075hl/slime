@@ -64,7 +64,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 
 CKPT_ARGS=(
     --hf-checkpoint /mnt/public_02/huangliang45/models/Qwen3.8-27B
-    --ref-load /mnt/public_02/huangliang45/models/Qwen3.8-27B-torch-dist
+    --load /mnt/public_02/huangliang45/models/Qwen3.8-27B
     --save ${BASE_FOLDER}/qwen38_27b_ccrun_rl/
     --save-interval 20
     --no-save-optim
@@ -74,13 +74,14 @@ PERF_ARGS=(
     --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 2
     --context-parallel-size 2
+    --qwen-gdn-implementation megatron
     --sequence-parallel
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
     --use-dynamic-batch-size
     --max-tokens-per-gpu 16384
-    --log-probs-max-tokens-per-gpu 131072
+    --log-probs-max-tokens-per-gpu 32768
 )
 
 ROLLOUT_ARGS=(
@@ -102,9 +103,6 @@ ROLLOUT_ARGS=(
 
 GRPO_ARGS=(
     --advantage-estimator grpo
-    --use-kl-loss
-    --kl-loss-coef 0.001
-    --kl-loss-type low_var_kl
     --entropy-coef 0.0
     --eps-clip 0.2
     --eps-clip-high 0.28
