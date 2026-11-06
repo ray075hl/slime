@@ -16,6 +16,7 @@ import asyncio
 import copy
 import dataclasses
 import logging
+_mod_logger = logging.getLogger(__name__)
 import math
 import time
 import uuid
@@ -27,7 +28,7 @@ import aiohttp
 from aiohttp import web
 
 from slime.agent.parsing import parse_model_output
-from slime.agent.trajectory import REPLAY_FIELDS, TrajectoryManager, TurnRecord
+from slime.agent.trajectory import REPLAY_FIELDS, TrajectoryManager, TurnRecord, _canonical_message
 from slime.observability.trace_utils import TraceHandle, bind_trace_carrier, build_sglang_meta_trace_attrs, trace_span
 from slime.utils.score_centering import score_centering_request
 from slime.utils.types import Sample
@@ -55,6 +56,11 @@ class Session:
     apply_chat_template_kwargs: dict = dataclasses.field(default_factory=dict)
     prompt_prefixes: list[PromptPrefix] = dataclasses.field(default_factory=list)
     trace: TraceHandle | None = None
+    # Whitespace-normalized problem statement. If set, a turn whose rendered
+    # prompt (tok.decode of prompt_ids, same text form the model sees) does NOT
+    # contain it is a non-main turn (probe / sub-agent) and is excluded from
+    # trajectory recording + prompt_prefixes, preventing false-fork. Empty = off.
+    task_fingerprint: str = ""
 
 
 @dataclasses.dataclass
@@ -90,6 +96,39 @@ def _render_token_ids(
     return list(ids)
 
 
+def _restore_canonical_assistants(messages: list[dict], session: "Session") -> list[dict]:
+    """Replace client-echoed assistant messages with the server's canonical
+    copies before any token rendering / comparison.
+
+    Stateless clients (Claude Code SDK) re-serialize the whole history every
+    turn and perturb assistant turns in ways no normalization can fully absorb:
+    injecting tool-call default fields (e.g. ``replace_all=false``), reordering
+    keys, or reformatting content. The server GENERATED these turns and owns
+    their exact canonical form (``prompt_prefixes[*].messages[-1]`` == the
+    manager_message built from the real sampled tokens). We therefore align
+    assistant messages newest-first and restore them wholesale, so the rendered
+    prompt reproduces the originally sampled tokens and the append-only splice
+    stays exact. This is comparison-free (position-based), so default-field
+    injection cannot defeat it. user / tool messages remain client-owned."""
+    canon = [
+        p.messages[-1]
+        for p in sorted(session.prompt_prefixes, key=lambda p: len(p.messages))
+        if p.messages and isinstance(p.messages[-1], dict) and p.messages[-1].get("role") == "assistant"
+    ]
+    if not canon:
+        return messages
+    positions = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"]
+    out = list(messages)
+    restored = 0
+    for pos, c in zip(reversed(positions), reversed(canon)):
+        if out[pos] != c:
+            out[pos] = copy.deepcopy(c)
+            restored += 1
+    if restored:
+        _mod_logger.debug("CANON_RESTORE restored %d assistant turn(s) to server-canonical", restored)
+    return out
+
+
 def _session_prompt_ids(messages, tokenizer, *, tools, session: Session) -> list[int]:
     """Extend a replayed assistant message using its original model tokens.
 
@@ -99,40 +138,67 @@ def _session_prompt_ids(messages, tokenizer, *, tools, session: Session) -> list
     The end-of-message special token is the splice boundary; if the template
     cannot prove that boundary, leave its normal rendering intact.
     """
+    # Restore server-canonical assistants first so client default-field injection
+    # (replace_all=false, etc.) cannot force a false fork via message mismatch.
+    messages = _restore_canonical_assistants(messages, session)
     kwargs = session.apply_chat_template_kwargs
     rendered = _render_token_ids(messages, tokenizer, tools=tools, apply_chat_template_kwargs=kwargs)
     special_ids = set(getattr(tokenizer, "all_special_ids", ()))
+    _diag_n = len(session.prompt_prefixes)
+    _diag_best = None
     for prefix in sorted(session.prompt_prefixes, key=lambda p: len(p.messages), reverse=True):
         turn = prefix.turn
         depth = len(prefix.messages)
-        if (
-            prefix.tools != tools
-            or depth >= len(messages)
-            or prefix.messages != messages[:depth]
-            or turn.finish_reason != "stop"
-            or not turn.output_ids
-            or turn.output_ids[-1] not in special_ids
-        ):
+        # --- SPLICE_DIAG: 逐条判定短路原因 ---
+        _r = []
+        if prefix.tools != tools: _r.append("tools_ne")
+        if depth >= len(messages): _r.append("depth>=len(msgs)")
+        # Normalized compare: assistants already restored to server-canonical
+        # above (immune to default-field injection); this absorbs user/tool/system
+        # drift (cache_control, list<->str content, reminders, whitespace).
+        _pm = [_canonical_message(m) for m in prefix.messages]
+        _cm = [_canonical_message(m) for m in messages[:depth]]
+        if _pm != _cm: _r.append("msgs_ne(111)")
+        if turn.finish_reason != "stop": _r.append("finish=%s" % turn.finish_reason)
+        if not turn.output_ids: _r.append("no_output_ids")
+        if turn.output_ids and turn.output_ids[-1] not in special_ids: _r.append("last_not_special=%s" % turn.output_ids[-1])
+        if _r:
+            if _diag_best is None or depth > _diag_best[0]:
+                _diag_best = (depth, "AGG:" + ",".join(_r))
             continue
-        # Two branches may have identical visible replies but different hidden
-        # reasoning. Without a unique token history, do not guess which one the
-        # client echoed.
         if any(
             other.messages == prefix.messages
             and other.tools == tools
             and (other.turn.prompt_ids != turn.prompt_ids or other.turn.output_ids != turn.output_ids)
             for other in session.prompt_prefixes
         ):
+            if _diag_best is None or depth > _diag_best[0]:
+                _diag_best = (depth, "AMBIGUOUS(120)")
             continue
         anchor = _render_token_ids(
             messages[:depth], tokenizer, tools=tools, add_generation_prompt=False, apply_chat_template_kwargs=kwargs
         )
         if rendered[: len(anchor)] != anchor:
+            _cp = 0
+            for _x, _y in zip(rendered, anchor):
+                if _x == _y: _cp += 1
+                else: break
+            _mod_logger.warning("SPLICE_DIAG branch=anchor_ne(130) depth=%d anchor_len=%d common=%d held_tok=%s rendered_tok=%s",
+                           depth, len(anchor), _cp,
+                           anchor[_cp] if _cp < len(anchor) else None,
+                           rendered[_cp] if _cp < len(rendered) else None)
+            if _diag_best is None or depth > _diag_best[0]:
+                _diag_best = (depth, "anchor_ne(130)@%d" % _cp)
             continue
         end = next((i for i in range(len(anchor) - 1, -1, -1) if anchor[i] == turn.output_ids[-1]), None)
         if end is None or tokenizer.decode(anchor[end + 1 :], skip_special_tokens=False).strip():
+            if _diag_best is None or depth > _diag_best[0]:
+                _diag_best = (depth, "boundary(132)end=%s" % end)
             continue
         return turn.prompt_ids + turn.output_ids + rendered[end + 1 :]
+    if _diag_n:
+        _mod_logger.warning("SPLICE_DIAG FALLBACK rendered(no splice) n_prefix=%d best=%s msgs=%d rendered_len=%d",
+                       _diag_n, _diag_best, len(messages), len(rendered))
     return rendered
 
 
@@ -280,6 +346,7 @@ class BaseAdapter:
         max_context_tokens: int = 0,
         apply_chat_template_kwargs: dict | None = None,
         trace: TraceHandle | None = None,
+        task_fingerprint: str = "",
     ) -> None:
         """Register a fresh per-sid Session; sids must be unique."""
         if sid in self.store:
@@ -289,6 +356,7 @@ class BaseAdapter:
             max_context_tokens=int(max_context_tokens or 0),
             apply_chat_template_kwargs=dict(apply_chat_template_kwargs or {}),
             trace=trace,
+            task_fingerprint=str(task_fingerprint or ""),
         )
 
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
@@ -330,6 +398,41 @@ class BaseAdapter:
         await self.shutdown_session(sid, wait_timeout=wait_timeout)
         session = self.store.pop(sid, None)
         max_sample_tokens = int(getattr(session, "max_context_tokens", 0) or 0) if session is not None else 0
+        # REBUILD_DUMP: 导出tree每turn原料(turn_index/tool名+args/output_ids长度/prompt长度)
+        # + session.prompt_prefixes的最后一个(最长)messages = 最后一次request的历史。
+        # 只读,给离线验证"最后一行+tree重建"用。失败不影响主流程。
+        try:
+            import json as _json, os as _os
+            _tree = self.manager._trees.get(sid)
+            _dump = {"sid": sid, "turns": [], "last_request_messages": None}
+            if _tree is not None:
+                def _walk(n):
+                    if n.role == "assistant" and getattr(n, "turn", None) is not None:
+                        msg = n.message or {}
+                        tcs = []
+                        for tc in (msg.get("tool_calls") or []):
+                            fn = tc.get("function") or tc
+                            tcs.append({"name": (fn.get("name") if isinstance(fn, dict) else None) or msg.get("name"),
+                                        "args": (fn.get("arguments") if isinstance(fn, dict) else None)})
+                        _dump["turns"].append({
+                            "turn_index": getattr(n, "turn_index", None),
+                            "tool_calls": tcs,
+                            "wire_tool_ids": (msg.get("_wire_tool_ids") or []),
+                            "n_output_ids": len(n.turn.output_ids or []),
+                            "n_prompt_ids": len(n.turn.prompt_ids or []),
+                            "finish": n.turn.finish_reason,
+                        })
+                    for c in n.children: _walk(c)
+                _walk(_tree)
+            if session is not None and getattr(session, "prompt_prefixes", None):
+                _last = max(session.prompt_prefixes, key=lambda p: len(p.messages))
+                _dump["last_request_messages"] = _last.messages
+            _dd = _os.environ.get("CC_RUN_RL_OUTPUT_DIR", "/tmp")
+            _os.makedirs(_os.path.join(_dd, "rebuild_dump"), exist_ok=True)
+            with open(_os.path.join(_dd, "rebuild_dump", sid.replace("/", "_") + ".json"), "w") as _f:
+                _json.dump(_dump, _f, ensure_ascii=False)
+        except Exception as _e:
+            _mod_logger.warning("REBUILD_DUMP failed sid=%s: %s", sid, _e)
         samples = self.manager.get_trajectory(
             sid,
             base_sample=base_sample,
@@ -460,6 +563,23 @@ class BaseAdapter:
                 turn,
             )
 
+            # Drop non-main-agent turns (probes / sub-agents) whose prompt lacks
+            # the problem statement, BEFORE they enter prompt_prefixes and
+            # false-fork the trajectory. Match on tok.decode(prompt_ids) -- the
+            # exact natural text the model saw (NOT json.dumps, whose \n escaping
+            # breaks whitespace normalization). Mirrors rl_runner._normalize_ps_text.
+            if s.task_fingerprint:
+                import re as _re
+                _dec = tok.decode(prompt_ids, skip_special_tokens=False)
+                _dec = _re.sub(r"<system-reminder>.*?</system-reminder>", "", _dec, flags=_re.S)
+                _txt = _re.sub(r"\s+", " ", _dec).strip()
+                if s.task_fingerprint not in _txt:
+                    _mod_logger.warning(
+                        "PROBE_SKIP sid=%s skip record (no problem_statement in prompt) prompt_tok=%d",
+                        sid, len(prompt_ids),
+                    )
+                    return response
+
             self.manager.record_turn(
                 sid,
                 turn=turn,
@@ -570,7 +690,7 @@ async def call_sglang_generate(
     sglang_url = adapter.sglang_url
     rid = None
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=7200)
     captured = Sample(tokens=list(prompt_ids))
     max_new_tokens = int(sp["max_new_tokens"])
     partial_rollout = getattr(adapter.rollout_args, "partial_rollout", False)

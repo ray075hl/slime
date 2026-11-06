@@ -9,8 +9,10 @@ re-tokenization drift via fork/replace.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
+import re as _re
 import logging
 import math
 from collections.abc import Iterator
@@ -21,6 +23,54 @@ import torch
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_message(msg: dict) -> tuple:
+    """Normalize a history message for mount-point comparison, absorbing the
+    client's lossless re-rendering so append-only turns don't false-fork.
+
+    Claude Code re-serializes the whole history every turn (stateless API), so a
+    replayed message rarely matches byte-for-byte what we recorded: (a) prompt
+    cache_control breakpoints drift across turns, (b) a system/user content may
+    flip between a plain string and a [{type:text}] block list, (c) injected
+    <system-reminder> text (gitStatus/attribution/todo) changes per turn, (d)
+    whitespace wobbles. None of these change what the model saw, so we strip
+    them and compare the semantic residue. Real content divergence (different
+    text or tool_calls) still differs and still forks. Comparison-only: the
+    tree keeps each node's original message untouched."""
+    m = copy.deepcopy(msg)
+
+    def _strip_cc(o):
+        if isinstance(o, dict):
+            o.pop("cache_control", None)
+            for v in o.values():
+                _strip_cc(v)
+        elif isinstance(o, list):
+            for v in o:
+                _strip_cc(v)
+    _strip_cc(m)
+
+    def _flat(c):
+        if isinstance(c, list):
+            out = []
+            for x in c:
+                if isinstance(x, dict) and x.get("type") == "text":
+                    out.append(x.get("text", ""))
+                else:
+                    import json as _json
+                    out.append(_json.dumps(x, ensure_ascii=False, sort_keys=True))
+            return "".join(out)
+        return c if isinstance(c, str) else ("" if c is None else str(c))
+
+    txt = _flat(m.get("content"))
+    txt = _re.sub(r"<system-reminder>.*?</system-reminder>", "", txt, flags=_re.S)
+    txt = _re.sub(r"\s+", " ", txt).strip()
+
+    tc = m.get("tool_calls")
+    if tc:
+        import json as _json
+        tc = _json.dumps(tc, ensure_ascii=False, sort_keys=True)
+    return (m.get("role"), txt, tc)
 
 REPLAY_FIELDS = (
     "rollout_top_p_token_ids",
@@ -146,6 +196,7 @@ def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
 class DriftKind(enum.Enum):
     CLEAN = "clean"  # drift == 0: prompt_ids exactly extends held tokens; append the tail beyond them
     REALIGN = "realign"  # drift inside the most-recent response span and short incoming response; replace that span (loss_mask=0)
+    REALIGN_TAIL = "realign_tail"  # drift falls entirely in a non-trained (loss_mask=0) tail (user/tool re-render); overwrite just that tail, no trained token touched -> never fork regardless of output length
     FORK = "fork"  # everything else: close this builder, open a fresh one as a fork
 
 
@@ -206,11 +257,14 @@ class _SampleBuilder:
             or "rollout_routed_experts" in new_replay
             or held_replay.keys() != new_replay.keys()
         ):
+            logger.warning("DRIFT_FORK branch=replay_keys held=%s new=%s",
+                           sorted(held_replay.keys()), sorted(new_replay.keys()))
             return DriftKind.FORK
         if "rollout_topk_token_ids" in held_replay and (
             torch.as_tensor(held_replay["rollout_topk_token_ids"]).shape[1:]
             != torch.as_tensor(new_replay["rollout_topk_token_ids"]).shape[1:]
         ):
+            logger.warning("DRIFT_FORK branch=topk_shape")
             return DriftKind.FORK
         realign_at = _common_prefix_len(self.tokens, turn.prompt_ids)
         drift = len(self.tokens) - realign_at
@@ -218,6 +272,8 @@ class _SampleBuilder:
         if drift == 0:
             return DriftKind.CLEAN
         if held_replay:
+            logger.warning("DRIFT_FORK branch=held_replay drift=%d held_len=%d prompt_len=%d",
+                           drift, len(self.tokens), len(turn.prompt_ids))
             return DriftKind.FORK
 
         # REALIGN only heals drift that falls inside the most-recent response span
@@ -225,6 +281,26 @@ class _SampleBuilder:
         start = self.last_response_start_idx
         if start is not None and realign_at >= start and len(turn.output_ids) < self._fork_threshold:
             return DriftKind.REALIGN
+        # B/loss_mask-aware: if the divergence sits entirely in a non-trained tail
+        # (every held token from realign_at onward has loss_mask=0, i.e. a user/tool
+        # region re-rendered by the client), overwriting it loses no training signal.
+        # Absorb it regardless of incoming output length -- this immunizes against
+        # ANY user/tool drift (cache_control and whatever the SDK does next) without
+        # enumerating drift types, and never touches trained assistant tokens.
+        if start is not None and 0 < realign_at <= len(self.loss_mask) and not any(self.loss_mask[realign_at:]):
+            logger.warning("REALIGN_TAIL drift=%d realign_at=%d held_len=%d prompt_len=%d out_len=%d (non-trained tail, absorb)",
+                           drift, realign_at, len(self.tokens), len(turn.prompt_ids), len(turn.output_ids))
+            return DriftKind.REALIGN_TAIL
+        # 诊断:token级drift导致的FORK(re-tokenization)。打印drift位置/是否在最近response内/边界token
+        _inside = (start is not None and realign_at >= start)
+        _htok = self.tokens[realign_at] if realign_at < len(self.tokens) else None
+        _ptok = turn.prompt_ids[realign_at] if realign_at < len(turn.prompt_ids) else None
+        logger.warning(
+            "DRIFT_FORK branch=token_drift drift=%d realign_at=%d held_len=%d prompt_len=%d "
+            "inside_last_resp=%s out_ids_len=%d fork_threshold=%d held_tok=%s prompt_tok=%s",
+            drift, realign_at, len(self.tokens), len(turn.prompt_ids),
+            _inside, len(turn.output_ids), self._fork_threshold, _htok, _ptok,
+        )
         return DriftKind.FORK
 
     def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
@@ -240,6 +316,11 @@ class _SampleBuilder:
         # --- append this turn's prompt tail (loss_mask=0) ---
         if kind is DriftKind.REALIGN:
             self._align_to_prompt(turn.prompt_ids)  # drop the drifted tail, re-append from prompt
+        elif kind is DriftKind.REALIGN_TAIL:
+            # overwrite only the non-trained tail from the exact drift point, so
+            # earlier tokens (including the most-recent trained assistant output)
+            # stay byte-identical. Safe because that tail is all loss_mask=0.
+            self._align_tail_from(_common_prefix_len(self.tokens, turn.prompt_ids), turn.prompt_ids)
         else:  # CLEAN: held tokens are an exact prefix of prompt_ids; append the tail beyond them
             self._append_tokens(turn.prompt_ids[len(self.tokens) :], loss_mask=0)
 
@@ -299,6 +380,15 @@ class _SampleBuilder:
         self.tokens[response_start:] = tail
         self.loss_mask[response_start:] = [0] * len(tail)
         self.logprobs[response_start:] = [0.0] * len(tail)
+
+    def _align_tail_from(self, start_idx: int, prompt_ids: list[int]) -> None:
+        """Overwrite held tokens from ``start_idx`` (the exact drift point) with the
+        prompt's tail as loss_mask=0. Caller guarantees loss_mask[start_idx:] is all
+        zero, so no trained token is disturbed and token/mask/logprob stay aligned."""
+        tail = prompt_ids[start_idx:]
+        self.tokens[start_idx:] = tail
+        self.loss_mask[start_idx:] = [0] * len(tail)
+        self.logprobs[start_idx:] = [0.0] * len(tail)
 
     def _append_tokens(self, ids: list[int], *, loss_mask: int, logprobs: list[float] | None = None) -> None:
         self.tokens.extend(ids)
@@ -401,6 +491,10 @@ class TrajectoryManager:
         node, depth = self._try_merge_assistant_rewrite(sid, node, prompt_messages, depth)
         node = self._mount_prompt_messages(node, prompt_messages[depth:])
         self._attach_assistant_leaf(sid, node, turn=turn, response_message=response_message, metadata=metadata)
+        _nleaves = sum(1 for _ in root.leaves())
+        if _nleaves > 1:
+            logger.warning("MOUNT_DIAG sid=%s after turn: tree now has %d leaves (multi-leaf=fork) mount_depth=%d msgs=%d",
+                           sid, _nleaves, depth, len(prompt_messages))
 
     def get_trajectory(
         self,
@@ -441,6 +535,93 @@ class TrajectoryManager:
         self._turn_count.pop(sid, None)
         return samples
 
+    def rebuild_main_agent_sample(
+        self,
+        sid: str,
+        ordered_wire_ids: list[str],
+        *,
+        base_sample,
+        reward: float = 0.0,
+        extra_metadata: dict[str, Any] | None = None,
+        max_sample_tokens: int = 0,
+    ) -> list:
+        """Rebuild ONE clean main-agent Sample from an explicit tool_use-id order.
+
+        The caller (rl_runner) locates the main agent's final request in
+        litellm_requests.jsonl and extracts the ordered wire tool_use ids of its
+        assistant turns. Those ids uniquely index the generating turns this
+        session recorded (each turn carries its wire ids in message[
+        '_wire_tool_ids']). Walking them in order and appending into a single
+        builder yields the true linear trajectory, with api-retry / fork / probe
+        / sub-agent turns excluded automatically (their ids never appear in the
+        main agent's final history). This sidesteps the tree's mount/split
+        heuristics entirely -- the id order IS the ground-truth path.
+
+        Returns [] if no turn is found (caller falls back to get_trajectory).
+        """
+        root = self._trees.get(sid)
+        if root is None or not ordered_wire_ids:
+            return []
+        # index: wire_tool_id -> assistant MessageNode(with .turn)
+        id2node: dict[str, MessageNode] = {}
+        def _walk(n):
+            if n.role == "assistant" and getattr(n, "turn", None) is not None:
+                for wid in (n.message or {}).get("_wire_tool_ids", []) or []:
+                    id2node.setdefault(wid, n)
+            for c in n.children:
+                _walk(c)
+        _walk(root)
+
+        # pick nodes in the main-agent id order (dedup: one node may own several ids)
+        seen_nodes: set[int] = set()
+        ordered_nodes = []
+        for wid in ordered_wire_ids:
+            node = id2node.get(wid)
+            if node is not None and id(node) not in seen_nodes:
+                seen_nodes.add(id(node))
+                ordered_nodes.append(node)
+        if not ordered_nodes:
+            logger.warning("REBUILD sid=%s ordered_nodes EMPTY: wire_ids=%d id2node=%d (no id matched tree)",
+                           sid, len(ordered_wire_ids), len(id2node))
+            return []
+        logger.info("REBUILD sid=%s wire_ids=%d id2node=%d ordered_nodes=%d (matched %d/%d)",
+                    sid, len(ordered_wire_ids), len(id2node), len(ordered_nodes),
+                    sum(1 for w in ordered_wire_ids if w in id2node), len(ordered_wire_ids))
+
+        builder = _SampleBuilder(self._fork_threshold)
+        forks = 0
+        for _ni, node in enumerate(ordered_nodes):
+            turn = node.turn
+            if turn is None:
+                logger.warning("REBUILD sid=%s node#%d has turn=None, skip", sid, _ni)
+                continue
+            try:
+                if not builder.tokens:
+                    builder.append_turn(turn, DriftKind.CLEAN, trained=True)
+                    continue
+                kind = builder.classify_token_drift(turn)
+                if kind is DriftKind.FORK:
+                    forks += 1
+                    builder.append_turn(turn, DriftKind.CLEAN, trained=True)
+                else:
+                    builder.append_turn(turn, kind, trained=True)
+            except Exception as _e:
+                _pl = len(getattr(turn, "prompt_ids", []) or [])
+                _ol = len(getattr(turn, "output_ids", []) or [])
+                logger.warning("REBUILD sid=%s FAIL at node#%d/%d prompt_ids=%d output_ids=%d builder_tokens=%d err=%r",
+                               sid, _ni, len(ordered_nodes), _pl, _ol, len(builder.tokens), _e)
+                raise
+        if forks:
+            logger.warning("REBUILD sid=%s unexpected FORK x%d on main-agent id path (forced CLEAN)", sid, forks)
+
+        if not builder.has_trained_response():
+            return []
+        sample = builder.to_sample(base_sample, extra_metadata, max_sample_tokens)
+        sample.reward = reward
+        self._trees.pop(sid, None)
+        self._turn_count.pop(sid, None)
+        return [sample]
+
     def drop_session(self, sid: str) -> None:
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
@@ -455,11 +636,69 @@ class TrajectoryManager:
         while depth < len(messages):
             msg = messages[depth]
             next_child = None
-            for child in node.children:
-                if child.role == msg.get("role") and child.message == msg:
-                    next_child = child
-                    break
+            _role = msg.get("role")
+            # LAYERED_ALIGN: assistant turns were generated by the server; the
+            # client replays them with lossless but non-identical edits (SDK adds
+            # tool-call default fields like replace_all=false, reorders keys).
+            # Under append-only rollout the n-th replayed assistant always maps to
+            # the n-th generated assistant, so align assistants BY POSITION (role
+            # only) when the mount node has exactly one assistant child -- never
+            # comparing their content, which immunizes against default-field
+            # injection. With >1 assistant child the tree already branched and
+            # position is ambiguous, so fall back to canonical comparison.
+            # user/tool messages stay content-matched (canonical) since those are
+            # client-owned and must distinguish genuinely different histories.
+            if _role == "assistant":
+                _asst_children = [c for c in node.children if c.role == "assistant"]
+                if len(_asst_children) == 1:
+                    next_child = _asst_children[0]
+                else:
+                    _msg_canon = _canonical_message(msg)
+                    for child in _asst_children:
+                        if _canonical_message(child.message) == _msg_canon:
+                            next_child = child
+                            break
+            else:
+                _msg_canon = _canonical_message(msg)
+                for child in node.children:
+                    if child.role == _role and _canonical_message(child.message) == _msg_canon:
+                        next_child = child
+                        break
             if next_child is None:
+                # MOUNT_DIAG: 挂载在此中断。若此节点已有同role的child,就是即将multi-leaf fork。
+                if depth < len(messages):
+                    _sibs = [c for c in node.children if c.role == msg.get("role")]
+                    if _sibs:
+                        _sc = _canonical_message(_sibs[0].message)
+                        _a = repr(_sc[1][:80]); _b = repr(_msg_canon[1][:80])
+                        _firstdiff = -1
+                        _sa, _sb = _sc[1], _msg_canon[1]
+                        for _k in range(min(len(_sa), len(_sb))):
+                            if _sa[_k] != _sb[_k]:
+                                _firstdiff = _k; break
+                        logger.warning(
+                            "MOUNT_DIAG break@depth=%d role=%s existing_same_role_children=%d "
+                            "=> WILL MULTI-LEAF FORK. canon_role_eq=%s canon_tc_eq=%s firstdiff@%s",
+                            depth, msg.get("role"), len(_sibs),
+                            _sc[0] == _msg_canon[0], _sc[2] == _msg_canon[2], _firstdiff,
+                        )
+                        if _firstdiff >= 0:
+                            logger.warning("MOUNT_DIAG   existing_canon=...%s...", repr(_sa[max(0,_firstdiff-25):_firstdiff+30]))
+                            logger.warning("MOUNT_DIAG   newmsg_canon =...%s...", repr(_sb[max(0,_firstdiff-25):_firstdiff+30]))
+                        else:
+                            logger.warning("MOUNT_DIAG   canon text equal but tc/role differ: existing_tc=%s new_tc=%s",
+                                           repr(str(_sc[2])[:120]), repr(str(_msg_canon[2])[:120]))
+                        # 原始(未canonical)差异,看是什么漂移
+                        import json as _json
+                        _rawa = _json.dumps(_sibs[0].message, ensure_ascii=False)
+                        _rawb = _json.dumps(msg, ensure_ascii=False)
+                        for _k in range(min(len(_rawa), len(_rawb))):
+                            if _rawa[_k] != _rawb[_k]:
+                                logger.warning("MOUNT_DIAG   RAW firstdiff@%d existing=%s", _k, repr(_rawa[max(0,_k-20):_k+40]))
+                                logger.warning("MOUNT_DIAG   RAW                 new     =%s", repr(_rawb[max(0,_k-20):_k+40]))
+                                break
+                        else:
+                            logger.warning("MOUNT_DIAG   RAW equal (len e=%d n=%d)", len(_rawa), len(_rawb))
                 break
             node = next_child
             depth += 1
