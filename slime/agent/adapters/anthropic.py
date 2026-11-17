@@ -184,11 +184,13 @@ def _build_reply_parts(
         blocks.append({"type": "text", "text": parsed.text})
 
     manager_tcs: list[dict] = []
+    wire_tool_ids: list[str] = []
     for tu in parsed.tool_uses:
         tu_id = f"toolu_{secrets.token_hex(8)}"
         blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]})
         # tu_id is wire-only; tool_call_dict drops it so the leaf matches its echo
         manager_tcs.append(tool_call_dict(tu["name"], tu.get("input")))
+        wire_tool_ids.append(tu_id)
 
     if not blocks:
         blocks.append({"type": "text", "text": ""})
@@ -205,6 +207,12 @@ def _build_reply_parts(
         manager_message["reasoning_content"] = parsed.reasoning
     if manager_tcs:
         manager_message["tool_calls"] = manager_tcs
+    if wire_tool_ids:
+        # Sidecar: wire tool_use ids this turn emitted, for offline segment
+        # rebuild (match main-agent history's echoed tool_use id -> this turn's
+        # tokens). Underscore-prefixed so it never participates in message
+        # equality / canonical comparison used by mount/splice.
+        manager_message["_wire_tool_ids"] = wire_tool_ids
 
     return blocks, stop_reason, manager_message
 
